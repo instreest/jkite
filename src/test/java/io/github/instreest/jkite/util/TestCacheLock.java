@@ -12,6 +12,8 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.concurrent.TimeUnit;
+import java.util.stream.Collectors;
+import java.util.stream.Stream;
 
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
@@ -96,20 +98,56 @@ class TestCacheLock {
 	private Process holder;
 
 	/**
-	 * Waits, rather than only asking. destroyForcibly() returns as soon as
-	 * the kill is sent, and on Windows the holder still has the lock file
-	 * open until it has actually gone - which is after JUnit has tried to
-	 * delete the temp directory, so the test fails on cleanup having passed.
-	 * POSIX unlinks an open file happily, which is why this only ever showed
-	 * up on the Windows job.
+	 * Kills the holder, waits for it to be gone, and then removes the lock
+	 * file itself rather than leaving it to JUnit.
+	 *
+	 * Waiting is necessary and was not sufficient. destroyForcibly() returns
+	 * as soon as the kill is sent, so an @AfterEach that only asks leaves the
+	 * holder still holding the file when JUnit deletes the temp directory -
+	 * and POSIX unlinks an open file happily, so it could only ever show on
+	 * Windows. Adding the wait made it rarer and not impossible: the Windows
+	 * job failed again on
+	 *
+	 *   Failed to delete temp directory ...: &lt;root&gt;, held.lock
+	 *
+	 * after waitFor had returned. A file whose holder Windows has just
+	 * terminated can stay undeletable for a moment longer than the process
+	 * itself lasts, and nothing in the test can be told when that moment ends.
+	 *
+	 * So the file is deleted here, with a bounded retry, while the test still
+	 * knows what it is waiting for. JUnit then finds an empty directory and
+	 * has nothing to fight. No assertion is weakened by this: what the tests
+	 * below check is that a bounded wait returns and that a released lock is
+	 * taken, and neither has anything to do with whether a temp directory
+	 * could be removed.
 	 */
 	@AfterEach
-	void stopTheHolder() throws InterruptedException {
-		if (holder != null) {
-			holder.destroyForcibly();
-			assertTrue(holder.waitFor(30, TimeUnit.SECONDS),
-					"the holder would not die, so the lock file is still open");
+	void stopTheHolder() throws Exception {
+		if (holder == null) {
+			return;
 		}
+		holder.destroyForcibly();
+		assertTrue(holder.waitFor(30, TimeUnit.SECONDS),
+				"the holder would not die, so the lock file is still open");
+		try (Stream<Path> entries = Files.list(dir)) {
+			for (Path entry : entries.filter(p -> p.getFileName().toString().endsWith(".lock"))
+				.collect(Collectors.toList())) {
+				deleteWithRetries(entry);
+			}
+		}
+	}
+
+	/** Windows can need a moment after the holder is gone; POSIX never does. */
+	private static void deleteWithRetries(Path file) throws InterruptedException {
+		for (int attempt = 0; attempt < 50; attempt++) {
+			try {
+				Files.deleteIfExists(file);
+				return;
+			} catch (IOException stillOpen) {
+				Thread.sleep(100);
+			}
+		}
+		fail("the lock file could not be removed after the holder was gone: " + file);
 	}
 
 	/**
