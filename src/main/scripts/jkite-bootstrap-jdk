@@ -1,0 +1,287 @@
+#!/usr/bin/env bash
+#
+# Installs the JDK that runs jkite.jar when the machine has none: the
+# Temurin that jkite.properties pins for this platform, into
+# $JKITE_CACHE_DIR/jdks/bootstrap (~/.jkite/cache/jdks/bootstrap). It
+# prints that directory on stdout and says nothing else there; progress and
+# errors go to stderr. When the JDK is already installed it only prints.
+#
+# The version, URL and SHA-256 were resolved when jkite was released and
+# are committed with the project, so there is no index to read and nothing to
+# decide here: download, verify, unpack.
+#
+# The launcher (jkite) runs it when it finds no usable JDK; it can just as
+# well be run by hand, or replaced by anything else that puts a JDK there.
+#
+#   jkite-bootstrap-jdk            install if needed, print the JDK home
+#
+# Environment:
+#   JKITE_DIR, JKITE_CACHE_DIR   where jkite keeps things
+#   JKITE_DOWNLOAD_RETRY, JKITE_DOWNLOAD_RETRY_DELAY
+#   JKITE_LOCK_TIMEOUT               seconds to wait for another run's download
+#
+# Needs curl or wget, sha256sum or shasum, and tar with gzip.
+#
+# Several jkite runs can be started at the same time (a build matrix, a
+# multi-module build). They share ~/.jkite, so the download takes a
+# directory lock (mkdir is atomic) and the JDK is unpacked into a directory of
+# this run's own that is renamed into place.
+
+# --- Settings ----------------------------------------------------------------
+
+# Tells this run's temporary files apart from those of a jkite running at
+# the same time
+runId=$$
+
+# How long to wait (in seconds) for another run that is downloading the JDK
+lockTimeout=${JKITE_LOCK_TIMEOUT:-600}
+
+# How often a failed download is retried, and how long to wait in between
+# (0 means an exponential backoff of 1, 2, 4, ... seconds)
+downloadRetry=${JKITE_DOWNLOAD_RETRY:-5}
+downloadRetryDelay=${JKITE_DOWNLOAD_RETRY_DELAY:-0}
+
+if [[ -z "$JKITE_DIR" ]]; then LITEDIR="$HOME/.jkite"; else LITEDIR="$JKITE_DIR"; fi
+if [[ -z "$JKITE_CACHE_DIR" ]]; then CACHEDIR="$LITEDIR/cache"; else CACHEDIR="$JKITE_CACHE_DIR"; fi
+jdkDir="$CACHEDIR/jdks/bootstrap"
+
+script_dir() {
+  local script dir
+  script=${BASH_SOURCE[0]}
+  while [ -L "$script" ]; do
+    dir=$( cd -P "$( dirname "$script" )" >/dev/null 2>&1 && pwd )
+    script=$(readlink "$script")
+    [[ $script != /* ]] && script=$dir/$script
+  done
+  ( cd -P "$( dirname "$script" )" >/dev/null 2>&1 && pwd )
+}
+
+# --- The properties ----------------------------------------------------------
+
+# The value of key $1 in jkite.properties, empty when it is not there. The
+# file is ours, so this reads what we write: 'key=value' lines, '#' comments.
+property() {
+  [ -f "$propertiesFile" ] || return 0
+  sed -n "s/^[[:space:]]*$(echo "$1" | sed 's/\./\\./g')[[:space:]]*=[[:space:]]*//p" \
+    "$propertiesFile" | head -1 | tr -d '\r'
+}
+
+# The name this platform has in jkite.properties, e.g. linux-amd64
+platform() {
+  local osName archName
+  case "$(uname -s)" in
+    Linux*)
+      if [ -f /etc/alpine-release ]; then
+        echo "There is no JDK to install for Alpine (musl); install one yourself or set JAVA_HOME." 1>&2
+        return 1
+      fi
+      osName=linux;;
+    Darwin*)  osName=darwin;;
+    *)
+      echo "No JDK can be installed for this system: $(uname -s)" 1>&2
+      return 1;;
+  esac
+  case "$(uname -m)" in
+    x86_64|amd64)     archName=amd64;;
+    aarch64|arm64)    archName=arm64;;
+    *)
+      echo "No JDK can be installed for this architecture: $(uname -m)" 1>&2
+      return 1;;
+  esac
+  echo "$osName-$archName"
+}
+
+read_properties() {
+  local plat
+  if [ ! -f "$propertiesFile" ]; then
+    echo "$propertiesFile not found. Re-run $abs_jkite_dir/install.sh to restore it." 1>&2
+    return 1
+  fi
+  plat=$(platform) || return 1
+  jdkVersion=$(property bootstrapJdkVersion)
+  jdkUrl=$(property "bootstrapJdkUrl.$plat")
+  jdkSha256=$(property "bootstrapJdkSha256Sum.$plat")
+  if [ -z "$jdkUrl" ]; then
+    echo "$propertiesFile pins no JDK for $plat" 1>&2
+    return 1
+  fi
+  case "$jdkUrl" in
+    https://*) ;;
+    *) echo "Refusing to download a JDK over anything but https: $jdkUrl" 1>&2; return 1;;
+  esac
+}
+
+# --- Downloading -------------------------------------------------------------
+
+download() {
+  local attempt=0
+  local maxAttempts=$((downloadRetry + 1))
+  while true; do
+    attempt=$((attempt + 1))
+    if [ -x "$(command -v curl)" ]; then
+      curl -sLf --proto '=https' --proto-redir '=https' -o "$2" "$1"
+      retval=$?
+    elif [ -x "$(command -v wget)" ]; then
+      wget -q --https-only -O "$2" "$1"
+      retval=$?
+    else
+      echo "Error: curl or wget not found, please make sure one of them is installed" 1>&2
+      exit 1
+    fi
+    if [ $retval -eq 0 ] || [ $attempt -ge $maxAttempts ]; then
+      break
+    fi
+    if [ "$downloadRetryDelay" -gt 0 ] 2>/dev/null; then
+      sleepSeconds=$downloadRetryDelay
+    else
+      # Exponential backoff: 1, 2, 4, 8, ...
+      sleepSeconds=$((1 << (attempt - 1)))
+    fi
+    echo "Download $attempt/$maxAttempts failed. Retry in $sleepSeconds second(s)..." 1>&2
+    if [ $attempt -eq 1 ]; then
+      echo "(Set JKITE_DOWNLOAD_RETRY=0 to disable retries)" 1>&2
+    fi
+    sleep $sleepSeconds
+  done
+}
+
+sha256_of() {
+  if [ -x "$(command -v sha256sum)" ]; then
+    sha256sum "$1" | cut -d' ' -f1
+  elif [ -x "$(command -v shasum)" ]; then
+    shasum -a 256 "$1" | cut -d' ' -f1
+  fi
+}
+
+# --- Locking -----------------------------------------------------------------
+
+# Several jkite runs can share $JKITE_DIR, so the download takes a
+# directory lock. mkdir is atomic, so exactly one run gets it; the others wait,
+# and stop waiting as soon as $2 shows the work they waited for is done.
+#   0 - the lock is ours, do the work and release_lock afterwards
+#   1 - gave up (another run is stuck, or its lock directory is stale)
+#   2 - no need to do anything, another run already did the work
+acquire_lock() {  # $1 = lock directory, $2 = path that exists once the work is done
+  local waited=0
+  # the lock sits next to what it protects, which may not exist yet
+  mkdir -p "$(dirname "$1")"
+  while ! mkdir "$1" 2> /dev/null; do
+    if [ -e "$2" ]; then return 2; fi
+    if [ "$waited" -ge "$lockTimeout" ]; then
+      echo "Gave up after $lockTimeout seconds waiting for another jkite to finish." 1>&2
+      echo "If no other jkite is running, remove $1 and try again." 1>&2
+      return 1
+    fi
+    if [ "$waited" -eq 0 ]; then
+      echo "Waiting for another jkite to finish downloading..." 1>&2
+    fi
+    sleep 1
+    waited=$((waited + 1))
+  done
+  return 0
+}
+
+release_lock() {
+  rm -rf "$1"
+}
+
+# Releases the lock and removes this run's leftovers. Without it, a Ctrl-C
+# during the download this script itself asks the user to be patient about
+# leaves the lock directory behind, and then every jkite run on this machine -
+# in any project - waits out $lockTimeout before failing, with nothing to clear
+# it but a hand. The partial archive goes too: it is named after this run, so
+# no later run could have used it.
+clean_up_after_interrupt() {
+  if [ -n "${heldLock:-}" ]; then
+    release_lock "$heldLock"
+    heldLock=
+  fi
+  rm -rf "$CACHEDIR/jdks/bootstrap-$runId.tmp"
+  rm -f "$CACHEDIR/bootstrap-jdk-$runId.tar.gz"
+}
+
+# --- Installing --------------------------------------------------------------
+
+install_jdk() {
+  acquire_lock "$jdkDir.lock" "$jdkDir/bin/java"
+  case $? in
+    2) return 0 ;;
+    1) exit 1 ;;
+  esac
+  heldLock=$jdkDir.lock
+  trap 'clean_up_after_interrupt; exit 130' INT TERM HUP
+  trap 'clean_up_after_interrupt' EXIT
+  install_jdk_locked
+  retval=$?
+  release_lock "$jdkDir.lock"
+  heldLock=
+  trap - INT TERM HUP EXIT
+  if [ $retval -ne 0 ]; then exit $retval; fi
+}
+
+install_jdk_locked() {
+  local archive unpackdir actual root
+  # another run may have installed it while we waited for the lock
+  if [ -x "$jdkDir/bin/java" ]; then return 0; fi
+  mkdir -p "$CACHEDIR/jdks"
+  # this run's own names, so nothing is shared with a jkite running at the
+  # same time and the JDK only appears under its real name once it is complete
+  archive="$CACHEDIR/bootstrap-jdk-$runId.tar.gz"
+  unpackdir="$CACHEDIR/jdks/bootstrap-$runId.tmp"
+
+  echo "No Java found. Downloading Temurin $jdkVersion. Be patient, this can take several minutes..." 1>&2
+  download "$jdkUrl" "$archive"
+  if [ $retval -ne 0 ]; then
+    rm -f "$archive"
+    echo "Error downloading the JDK from $jdkUrl" 1>&2
+    return 1
+  fi
+
+  actual=$(sha256_of "$archive")
+  if [ -z "$actual" ]; then
+    rm -f "$archive"
+    echo "Neither sha256sum nor shasum is available, cannot verify the download" 1>&2
+    return 1
+  fi
+  if [ "$jdkSha256" != "$actual" ]; then
+    rm -f "$archive"
+    echo "SHA-256 mismatch for $jdkUrl: expected $jdkSha256 but got $actual" 1>&2
+    return 1
+  fi
+
+  echo "Installing Temurin $jdkVersion..." 1>&2
+  rm -rf "$unpackdir"
+  mkdir -p "$unpackdir"
+  # the archive is a .tar.gz on every platform this script serves; Windows is
+  # jkite-bootstrap-jdk.cmd's business
+  if ! gzip -cd "$archive" | tar xf - -C "$unpackdir"; then
+    rm -rf "$unpackdir"; rm -f "$archive"
+    echo "Error unpacking the JDK" 1>&2
+    return 1
+  fi
+  # the archive holds a single root folder, which becomes the JDK directory
+  root=$(find "$unpackdir" -mindepth 1 -maxdepth 1 -type d | head -1)
+  if [ -n "$root" ] && [ -d "$root/Contents/Home" ]; then root="$root/Contents/Home"; fi
+  if [ -z "$root" ] || [ ! -x "$root/bin/java" ]; then
+    rm -rf "$unpackdir"; rm -f "$archive"
+    echo "Error installing the JDK: no bin/java in $jdkUrl" 1>&2
+    return 1
+  fi
+  rm -rf "$jdkDir"
+  mv "$root" "$jdkDir"
+  rm -rf "$unpackdir"
+  rm -f "$archive"
+  return 0
+}
+
+# --- Main --------------------------------------------------------------------
+
+abs_jkite_dir=$(script_dir)
+propertiesFile=$abs_jkite_dir/jkite.properties
+
+if [ ! -x "$jdkDir/bin/java" ]; then
+  read_properties || exit 1
+  install_jdk
+fi
+
+echo "$jdkDir"

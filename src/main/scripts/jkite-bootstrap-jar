@@ -1,0 +1,278 @@
+#!/usr/bin/env bash
+#
+# Installs jkite.jar, the jkite a project asked for: the version, URL
+# and SHA-256 in the jkite.properties next to this script, downloaded into
+# $JKITE_CACHE_DIR/jkite/<version> (~/.jkite/cache/jkite/<version>).
+# It prints the jar's path on stdout and says nothing else there; progress and
+# errors go to stderr. When the jar is already installed it checks that the
+# installed one is the pinned one, and then only prints.
+#
+# The cache is per machine, not per project, so several projects that pin the
+# same version share one download. The launcher (jkite) runs this when
+# there is no jkite.jar next to it; it can just as well be run by hand, or
+# replaced by anything else that puts the jar there.
+#
+#   jkite-bootstrap-jar            install if needed, print the jar path
+#
+# Environment:
+#   JKITE_DIR, JKITE_CACHE_DIR       where jkite keeps things (~/.jkite)
+#   JKITE_DIST_URL               where to fetch the jar from, overriding
+#                                    distributionUrl (a corporate mirror)
+#   JKITE_DOWNLOAD_RETRY, JKITE_DOWNLOAD_RETRY_DELAY
+#   JKITE_LOCK_TIMEOUT           seconds to wait for another run's download
+#
+# Needs curl or wget, and sha256sum or shasum.
+#
+# Several jkite runs can be started at the same time (a build matrix, a
+# multi-module build). They share ~/.jkite, so the download takes a directory
+# lock (mkdir is atomic) and the jar is written to a file of this run's own
+# that is renamed into place.
+
+# --- Settings ----------------------------------------------------------------
+
+# Tells this run's temporary files apart from those of a jkite running at
+# the same time
+runId=$$
+
+# How long to wait (in seconds) for another run that is downloading the same jar
+lockTimeout=${JKITE_LOCK_TIMEOUT:-600}
+
+# How often a failed download is retried, and how long to wait in between
+# (0 means an exponential backoff of 1, 2, 4, ... seconds)
+downloadRetry=${JKITE_DOWNLOAD_RETRY:-5}
+downloadRetryDelay=${JKITE_DOWNLOAD_RETRY_DELAY:-0}
+
+if [[ -z "$JKITE_DIR" ]]; then LITEDIR="$HOME/.jkite"; else LITEDIR="$JKITE_DIR"; fi
+if [[ -z "$JKITE_CACHE_DIR" ]]; then CACHEDIR="$LITEDIR/cache"; else CACHEDIR="$JKITE_CACHE_DIR"; fi
+
+script_dir() {
+  local script dir
+  script=${BASH_SOURCE[0]}
+  while [ -L "$script" ]; do
+    dir=$( cd -P "$( dirname "$script" )" >/dev/null 2>&1 && pwd )
+    script=$(readlink "$script")
+    [[ $script != /* ]] && script=$dir/$script
+  done
+  ( cd -P "$( dirname "$script" )" >/dev/null 2>&1 && pwd )
+}
+
+# --- The properties ----------------------------------------------------------
+
+# The value of key $1 in $propertiesFile, empty when it is not there. The file
+# is ours, so this reads what we write: 'key=value' lines, '#' comments.
+property() {
+  sed -n "s/^[[:space:]]*$1[[:space:]]*=[[:space:]]*//p" "$propertiesFile" | head -1 | tr -d '\r'
+}
+
+read_properties() {
+  if [ ! -f "$propertiesFile" ]; then
+    echo "$propertiesFile not found. Re-run $abs_jkite_dir/install.sh to restore it." 1>&2
+    return 1
+  fi
+  distributionVersion=$(property distributionVersion)
+  distributionUrl=${JKITE_DIST_URL:-$(property distributionUrl)}
+  distributionSha256Sum=$(property distributionSha256Sum)
+  if [ -z "$distributionVersion" ] || [ -z "$distributionUrl" ]; then
+    echo "$propertiesFile needs a distributionVersion and a distributionUrl" 1>&2
+    return 1
+  fi
+  # Only https, so that neither a tampered properties file nor JKITE_DIST_URL
+  # can point the download at a plaintext host. A loopback address is allowed so
+  # that the tests can serve the jar locally.
+  case "$distributionUrl" in
+    https://*) ;;
+    http://127.0.0.1[:/]*|http://localhost[:/]*) ;;
+    *) echo "Refusing to download the jar over anything but https: $distributionUrl" 1>&2; return 1;;
+  esac
+}
+
+# --- Downloading -------------------------------------------------------------
+
+download() {
+  local attempt=0
+  local maxAttempts=$((downloadRetry + 1))
+  while true; do
+    attempt=$((attempt + 1))
+    if [ -x "$(command -v curl)" ]; then
+      curl -sLf --proto '=https,http' --proto-redir '=https' -o "$2" "$1"
+      retval=$?
+    elif [ -x "$(command -v wget)" ]; then
+      # --https-only also refuses to follow a redirect off https, which is what
+      # curl's --proto-redir does above. It cannot be used for the loopback the
+      # tests serve on, which the check above has already allowed through.
+      case "$1" in
+        https://*) wget -q --https-only -O "$2" "$1" ;;
+        *) wget -q -O "$2" "$1" ;;
+      esac
+      retval=$?
+    else
+      echo "Error: curl or wget not found, please make sure one of them is installed" 1>&2
+      exit 1
+    fi
+    if [ $retval -eq 0 ] || [ $attempt -ge $maxAttempts ]; then
+      break
+    fi
+    if [ "$downloadRetryDelay" -gt 0 ] 2>/dev/null; then
+      sleepSeconds=$downloadRetryDelay
+    else
+      # Exponential backoff: 1, 2, 4, 8, ...
+      sleepSeconds=$((1 << (attempt - 1)))
+    fi
+    echo "Download $attempt/$maxAttempts failed. Retry in $sleepSeconds second(s)..." 1>&2
+    if [ $attempt -eq 1 ]; then
+      echo "(Set JKITE_DOWNLOAD_RETRY=0 to disable retries)" 1>&2
+    fi
+    sleep $sleepSeconds
+  done
+}
+
+sha256_of() {
+  if [ -x "$(command -v sha256sum)" ]; then
+    sha256sum "$1" | cut -d' ' -f1
+  elif [ -x "$(command -v shasum)" ]; then
+    shasum -a 256 "$1" | cut -d' ' -f1
+  fi
+}
+
+# --- Locking -----------------------------------------------------------------
+
+# Several jkite runs can share $JKITE_DIR, so the download takes a
+# directory lock. mkdir is atomic, so exactly one run gets it; the others wait,
+# and stop waiting as soon as $2 shows the work they waited for is done.
+#   0 - the lock is ours, do the work and release_lock afterwards
+#   1 - gave up (another run is stuck, or its lock directory is stale)
+#   2 - no need to do anything, another run already did the work
+acquire_lock() {  # $1 = lock directory, $2 = path that exists once the work is done
+  local waited=0
+  # the lock sits next to what it protects, which may not exist yet
+  mkdir -p "$(dirname "$1")"
+  while ! mkdir "$1" 2> /dev/null; do
+    if [ -e "$2" ]; then return 2; fi
+    if [ "$waited" -ge "$lockTimeout" ]; then
+      echo "Gave up after $lockTimeout seconds waiting for another jkite to finish." 1>&2
+      echo "If no other jkite is running, remove $1 and try again." 1>&2
+      return 1
+    fi
+    if [ "$waited" -eq 0 ]; then
+      echo "Waiting for another jkite to finish downloading..." 1>&2
+    fi
+    sleep 1
+    waited=$((waited + 1))
+  done
+  return 0
+}
+
+release_lock() {
+  rm -rf "$1"
+}
+
+# Releases the lock and removes this run's leftovers. Without it, a Ctrl-C
+# during the download leaves the lock directory behind, and then every jkite
+# run on this machine - in any project - waits out $lockTimeout before failing,
+# with nothing to clear it but a hand. The partial file goes too: it is named
+# after this run, so no later run could have used it.
+clean_up_after_interrupt() {
+  if [ -n "${heldLock:-}" ]; then
+    release_lock "$heldLock"
+    heldLock=
+  fi
+  rm -f "$jarDir/jkite-$runId.tmp"
+}
+
+# --- Installing --------------------------------------------------------------
+
+# True when $jarPath is there and is the jar this project pins.
+#
+# The hash is checked every run, not only right after the download: the cache is
+# shared by every project on this machine, so the jar sitting under this version
+# may have been put there by another project, pinning another hash. A jar is
+# this project's jar when this project's checksum says so, and not before.
+cached_jar_is_ours() {
+  local actual
+  [ -f "$jarPath" ] || return 1
+  # nothing to check against; install_jar_locked says so when it downloads
+  [ -n "$distributionSha256Sum" ] || return 0
+  actual=$(sha256_of "$jarPath")
+  [ "$distributionSha256Sum" = "$actual" ]
+}
+
+# Downloads the jar into $jarDir, one run at a time; the others wait and then
+# use what it installed.
+install_jar() {
+  acquire_lock "$jarDir.lock" "$jarPath"
+  case $? in
+    2) return 0 ;;
+    1) exit 1 ;;
+  esac
+  heldLock=$jarDir.lock
+  trap 'clean_up_after_interrupt; exit 130' INT TERM HUP
+  trap 'clean_up_after_interrupt' EXIT
+  install_jar_locked
+  retval=$?
+  release_lock "$jarDir.lock"
+  heldLock=
+  trap - INT TERM HUP EXIT
+  if [ $retval -ne 0 ]; then exit $retval; fi
+}
+
+install_jar_locked() {
+  local tmp actual
+  # another run may have installed it while we waited for the lock
+  if cached_jar_is_ours; then return 0; fi
+  if [ -f "$jarPath" ]; then
+    echo "The cached $jarPath is not what $propertiesFile pins, downloading it again" 1>&2
+  fi
+  mkdir -p "$jarDir"
+  # this run's own file, so nothing is shared with a jkite running at the
+  # same time, and the jar only appears under its real name once it is complete
+  tmp="$jarDir/jkite-$runId.tmp"
+
+  echo "Downloading jkite $distributionVersion..." 1>&2
+  download "$distributionUrl" "$tmp"
+  if [ $retval -ne 0 ]; then
+    rm -f "$tmp"
+    echo "Error downloading jkite from $distributionUrl" 1>&2
+    return 1
+  fi
+
+  if [ -n "$distributionSha256Sum" ]; then
+    actual=$(sha256_of "$tmp")
+    if [ -z "$actual" ]; then
+      echo "Neither sha256sum nor shasum is available, cannot verify the download" 1>&2
+      rm -f "$tmp"
+      return 1
+    fi
+    if [ "$distributionSha256Sum" != "$actual" ]; then
+      rm -f "$tmp"
+      echo "SHA-256 mismatch for $distributionUrl: expected $distributionSha256Sum but got $actual" 1>&2
+      echo "If you changed the version, update distributionSha256Sum in $propertiesFile." 1>&2
+      return 1
+    fi
+  else
+    echo "No distributionSha256Sum in $propertiesFile, skipping verification" 1>&2
+  fi
+
+  mv "$tmp" "$jarPath"
+  return 0
+}
+
+# --- Main --------------------------------------------------------------------
+
+abs_jkite_dir=$(script_dir)
+propertiesFile=$abs_jkite_dir/jkite.properties
+
+read_properties || exit 1
+jarDir="$CACHEDIR/jkite/$distributionVersion"
+jarPath="$jarDir/jkite.jar"
+
+if ! cached_jar_is_ours; then
+  install_jar
+  # install_jar returns as soon as another run has put a jar there, so what
+  # ends up being used is checked here rather than only where it is downloaded
+  if ! cached_jar_is_ours; then
+    echo "$jarPath is not the jar $propertiesFile pins, refusing to run it" 1>&2
+    exit 1
+  fi
+fi
+
+echo "$jarPath"

@@ -1,0 +1,18 @@
+# LF everywhere, because the POSIX launchers are read by bash and a CR at the
+# end of a line is part of the word it ends: "#!/usr/bin/env bash\r" names an
+# interpreter that does not exist.
+* text eol=lf
+
+# Except the batch files, which are read by cmd.exe. LF works there today -
+# the Windows CI job runs these scripts on every push and has never minded -
+# but cmd's own convention is CRLF, and the places it is known to be fussy
+# (labels, the blocks after if and for, a last line with no newline) are
+# exactly the constructs these scripts are built from. The line ending is not
+# where anyone should have to start looking.
+*.cmd text eol=crlf
+
+# Denote all files that are truly binary and should not be modified.
+*.png binary
+*.jpg binary
+*.jar binary
+*.db  binary

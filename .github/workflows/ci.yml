@@ -1,0 +1,193 @@
+# Builds and tests jkite on Linux, macOS and Windows, and runs the jar it
+# ships.
+#
+# Windows is the reason this workflow exists. The launcher and the two
+# bootstrap scripts are written twice, once for bash and once for
+# cmd.exe, and the cmd half cannot be run anywhere else: TestWindowsLaunchers
+# and TestWindowsWrapperInstall are annotated @EnabledOnOs(WINDOWS) and are
+# silently skipped on every other machine. This is where they actually run.
+#
+# macOS is here because the POSIX half of those scripts takes a different path
+# there and nothing else exercises it: the JDK layout it looks for is
+# Contents/Home, the digest comes from shasum rather than sha256sum, and the
+# userland is BSD's. jkite.properties pins a JDK for two Darwin platforms, so
+# they are platforms this project claims to support.
+#
+# No --stacktrace. It printed a hundred and fifty lines of Gradle's own
+# plumbing after every failure - never jkite's - and pushed the one thing worth
+# reading, which test failed, off the top of anything anyone scrolls back
+# through. The names are printed at the end of the run instead, and the whole
+# report is uploaded as an artifact whether the build passed or not.
+#
+# `./gradlew build` runs the whole suite, so no test is named here and a new
+# one is picked up by being written.
+name: CI
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# A new push replaces the run of the previous one on the same branch
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    # A stalled runner once held this job for four hours and was then killed
+    # with no log kept at all, so the one thing to look at afterwards did not
+    # exist. Every platform finishes in about four minutes, so anything past
+    # twenty is not slow, it is stuck - and failing then leaves the log behind.
+    timeout-minutes: 20
+    strategy:
+      # one platform failing must not hide the result of the other
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      # A JDK to build with. jkite targets Java 11 (--release 11), so this
+      # only has to be new enough for Gradle.
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      # bash on both platforms (Git for Windows ships it), so the command is
+      # the same one a contributor runs
+      - name: Build and test
+        shell: bash
+        run: ./gradlew build
+
+      # always, not only on failure: a green run is exactly when you want to
+      # read which tests were skipped, and the summary line prints a count
+      # rather than names
+      - name: Upload the test report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-report-${{ matrix.os }}
+          path: |
+            build/reports/tests/test
+            build/test-results/test
+          retention-days: 7
+
+  # The jar is what a project actually receives, and nothing above runs it: the
+  # tests load these classes from the build's own class path, which says
+  # nothing about whether the shipped artifact starts. It is built with
+  # --release 11 and the launcher will hand it to any JDK 11 or newer, so that
+  # is what is checked - the oldest Java it promises to work on, and the
+  # version its own launchers install.
+  shipped-jar:
+    name: the shipped jar on Java ${{ matrix.java }}
+    runs-on: ubuntu-latest
+    # as above; this one takes well under a minute
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        java: ['11', '25']
+    steps:
+      - uses: actions/checkout@v4
+
+      # The JDK the jar is run with. Its path is recorded before the build JDK
+      # replaces JAVA_HOME, rather than guessed from the JAVA_HOME_<n>_<arch>
+      # name, which depends on the runner's architecture.
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ matrix.java }}
+      - name: Remember where that JDK is
+        shell: bash
+        run: echo "RUN_JAVA=$JAVA_HOME/bin/java" >> "$GITHUB_ENV"
+
+      # and a JDK for Gradle, which does not run on every version jkite does
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      - name: Build the jar
+        shell: bash
+        run: ./gradlew shadowJar
+
+      - name: Run it
+        shell: bash
+        env:
+          # There is no terminal here, so "always" makes a download refuse
+          # rather than go ahead. Nothing in this smoke test should need one -
+          # the JDK running the jar satisfies the script's //JAVA - so anything
+          # that does is a failure rather than a slow step.
+          JKITE_CONFIRM_DOWNLOADS: always
+        run: |
+          set -euo pipefail
+          jar="$PWD/build/libs/jkite.jar"
+          work=$(mktemp -d)
+          export JKITE_DIR="$work/jkite" JKITE_CACHE_DIR="$work/cache"
+          cat > "$work/Hello.java" <<'JAVA'
+          //JAVA 11+
+          public class Hello {
+            public static void main(String[] args) {
+              System.out.println("ran on " + System.getProperty("java.specification.version")
+                  + " with " + String.join(",", args));
+              if (args.length > 0 && args[0].equals("fail")) {
+                System.exit(3);
+              }
+            }
+          }
+          JAVA
+
+          echo "== the version it reports, which needs no JDK at all"
+          "$RUN_JAVA" -jar "$jar" --version
+
+          echo "== a real build and run: arguments through, and stdout carrying nothing else"
+          out=$("$RUN_JAVA" -jar "$jar" "$work/Hello.java" a b 2> /dev/null)
+          echo "$out"
+          test "$out" = "ran on ${{ matrix.java }} with a,b"
+
+          echo "== the script's exit code, not the launcher's"
+          code=0
+          "$RUN_JAVA" -jar "$jar" "$work/Hello.java" fail > /dev/null 2>&1 || code=$?
+          test "$code" = 3
+
+  # The mirror is only a mirror while nobody edits it. An edit there compiles,
+  # passes every test, and is then overwritten by the next sync with nothing
+  # said - which has happened here once already. This is the only check that
+  # would have caught it, so it is cheap on purpose: one commit fetched from
+  # upstream, a few seconds.
+  mirror:
+    name: the mirror still matches upstream
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compare with upstream at the recorded revision
+        shell: bash
+        run: misc/sync-upstream.sh --check
+
+  # dist/ is what a project checks in, so it is the copy people actually run,
+  # and it is a copy: the launcher scripts are duplicated there from
+  # src/main/scripts. A fix made in one and not the other is a fix that is not
+  # in what anybody installs. The check for that existed and nothing ran it,
+  # which is the same as not having it.
+  dist:
+    name: dist/ matches the sources
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compare dist/ with the launcher scripts
+        shell: bash
+        run: misc/update-dist.sh --check

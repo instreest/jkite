@@ -1,0 +1,19 @@
+# Files mirrored byte for byte from jbangdev/jbang.
+#
+# They are never edited locally: run misc/sync-upstream.sh to bring in
+# upstream's changes. Everything the directive handling of JBang does is in
+# here, so a fix upstream reaches jkite by re-syncing these files.
+#
+# JBang also publishes these classes as dev.jbang:jbang.bin on Maven Central,
+# and depending on that instead of mirroring would work. It is not done because
+# the artifact brings the whole CLI's dependency tree for a parser that needs
+# none of it; see misc/library-boundary-analysis.md. Reconsider when syncing
+# these files becomes expensive, not when a new release appears.
+src/main/java/dev/jbang/ExitException.java
+src/main/java/dev/jbang/util/CommandBuffer.java
+src/main/java/dev/jbang/dependencies/MavenRepo.java
+src/main/java/dev/jbang/dependencies/MavenCoordinate.java
+src/main/java/dev/jbang/dependencies/JitPackUtil.java
+src/main/java/dev/jbang/source/parser/Directives.java
+src/main/java/dev/jbang/source/parser/KeyValue.java
+src/test/java/dev/jbang/source/parser/TestDirectives.java

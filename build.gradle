@@ -1,0 +1,291 @@
+import org.gradle.api.tasks.PathSensitivity
+plugins {
+	id "java"
+	id "com.gradleup.shadow" version "8.3.9"
+}
+
+// jkite: a reduced JBang that runs single-file Java programs. The only
+// deliverable is build/libs/jkite.jar, which misc/update-dist.sh copies to
+// dist/ together with the launchers; there is no other distribution.
+// misc/update-dist.sh passes -PjkiteVersion so that the jar knows the source
+// revision it was built from.
+version = project.hasProperty('jkiteVersion') ? project.property('jkiteVersion') : '0.1.0-dev'
+
+repositories {
+	mavenCentral()
+}
+
+// The jar is pinned by SHA-256 where it is installed (jkite.properties), so
+// the build that produces it has to be as fixed as that: the lock files record
+// every resolved version, transitive ones included, and
+// gradle/verification-metadata.xml records the checksum of every artifact that
+// is downloaded to build it. A dependency that changes under us fails the build
+// instead of ending up in a release.
+//
+//   ./gradlew --write-locks --write-verification-metadata sha256 build
+//
+// regenerates both after a version change.
+dependencyLocking {
+	lockAllConfigurations()
+}
+
+java {
+	sourceCompatibility = JavaVersion.VERSION_11
+	targetCompatibility = JavaVersion.VERSION_11
+}
+
+// MIMA decides which Maven Resolver comes in, and we use Resolver's own classes
+// (JavaScopes, the descriptor policy) directly, so that one has to be declared
+// too: keep it at the version MIMA brings, which the pom of the MIMA release
+// names. The lock file makes a divergence visible in review.
+def mimaVersion = "2.4.48"
+def resolverVersion = "1.9.27"
+def slf4jVersion = "2.0.18"
+
+dependencies {
+	// nullness annotations, required by the files mirrored from JBang
+	implementation 'org.jspecify:jspecify:1.0.0'
+
+	// Maven dependency resolution (the one thing we really cannot re-implement
+	// ourselves), with the HTTP transport Maven itself ships
+	implementation "eu.maveniverse.maven.mima:context:$mimaVersion"
+	implementation "eu.maveniverse.maven.mima.runtime:standalone-static:$mimaVersion"
+	implementation "org.apache.maven.resolver:maven-resolver-util:$resolverVersion"
+	implementation "org.slf4j:slf4j-nop:$slf4jVersion"
+
+	// JSON, for the JDK index. Comes with maven-resolver-transport-http anyway;
+	// declared because we use it ourselves
+	implementation "com.google.code.gson:gson:2.14.0"
+
+	// archive handling, for unpacking a downloaded JDK
+	implementation "org.apache.commons:commons-compress:1.28.0"
+
+	constraints {
+		// the HTTP transport brings the 1.7 line of the commons-logging bridge
+		// while everything else is on 2.0; one SLF4J, not one and a half
+		implementation("org.slf4j:jcl-over-slf4j:$slf4jVersion") {
+			because "aligned with the rest of SLF4J"
+		}
+	}
+
+	testImplementation platform("org.junit:junit-bom:5.14.4")
+	testImplementation "org.junit.jupiter:junit-jupiter"
+	testRuntimeOnly "org.junit.platform:junit-platform-launcher"
+	testImplementation "org.hamcrest:hamcrest:3.0"
+	// only for the launcher script tests, never shipped
+	testImplementation "org.wiremock:wiremock:3.13.2"
+}
+
+test {
+	useJUnitPlatform()
+	// The shaded jar, for the tests that have to run jkite rather than call
+	// into it. The second half of a run - jkite.jar starting a JVM for the
+	// script - is a different process with a different command line from the
+	// first, and a test that calls AppBuilder in-process never crosses it.
+	dependsOn shadowJar
+	// Named rather than read off shadowJar: its archiveFileName is set further
+	// down this file, so asking the task here gets the default name it still
+	// has at this point, and handing over the provider hands over its
+	// toString. If the name ever changes, the test that uses this says so.
+	systemProperty 'jkite.jar', layout.buildDirectory.file('libs/jkite.jar').get().asFile.absolutePath
+	// The launcher tests run the scripts out of the source tree, which Gradle
+	// cannot see from the Java sources. Without this, editing a script leaves
+	// the test task up to date and the tests that cover it never run.
+	inputs.files(fileTree('src/main/scripts')).withPropertyName('scripts')
+		.withPathSensitivity(PathSensitivity.RELATIVE)
+	inputs.files(fileTree('dist')).withPropertyName('dist')
+		.withPathSensitivity(PathSensitivity.RELATIVE)
+	// A download asks before it starts, and a test run has no terminal to answer
+	// on. Left to itself the gate would say what it is fetching and carry on,
+	// which is what "auto" does with nobody to ask - but then CI would depend on
+	// that default staying permissive. It is said here instead. The tests that
+	// are about the gate remove this from the environment they hand their
+	// subprocesses.
+	environment 'JKITE_CONFIRM_DOWNLOADS', 'never'
+	// sun.jnu.encoding, which decides whether this JVM can name a file at all,
+	// follows the locale. A container with no LANG set gets ASCII, and the
+	// tests for non-ASCII paths then skip themselves - correctly, but they are
+	// the tests most worth running, and skipping is not an answer. A developer
+	// machine and the CI runners have a UTF-8 locale; this gives one to
+	// whatever does not. It does not apply on Windows, where the JVM takes the
+	// ANSI code page instead, which is the thing those tests are there to find
+	// out about.
+	environment 'LANG', 'C.UTF-8'
+	environment 'LC_ALL', 'C.UTF-8'
+	// A local Maven repository of the test run's own. Dependency resolution is
+	// tested against a file: repository built on the spot, and without this the
+	// artifacts would land in the developer's ~/.m2/repository - so a test would
+	// write into it, and could pass because of something already there.
+	environment 'JKITE_MAVEN_REPO', layout.buildDirectory.dir('test-maven-repo').get().asFile.absolutePath
+	// and a JKITE_DIR of its own, for the same reason: the resolved-dependency
+	// cache is written on every resolve, and without this it would be the one
+	// in the developer's home directory that a test reads and writes.
+	environment 'JKITE_DIR', layout.buildDirectory.dir('test-jkite').get().asFile.absolutePath
+	// Set on purpose, and expected to be ignored. JKITE_CACHE_DIR_JARS and its
+	// two siblings used to move one kind of cached thing somewhere of its own:
+	// undocumented, unread by the launcher - so the JDKs one gave a machine two
+	// JDK caches - and it decided which directory --clear-cache emptied. With
+	// it set to somewhere obviously wrong, the test that every cache kind sits
+	// under the cache directory is what says it is still ignored.
+	environment 'JKITE_CACHE_DIR_JARS',
+		layout.buildDirectory.dir('should-be-ignored').get().asFile.absolutePath
+	environment 'JKITE_CACHE_DIR_JDKS',
+		layout.buildDirectory.dir('should-be-ignored').get().asFile.absolutePath
+	testLogging {
+		events "failed"
+		exceptionFormat = "full"
+	}
+	// How many actually ran. A test class that is silently skipped - an
+	// @EnabledOnOs that never matches, a platform assumption that is not true
+	// on this runner - is worse than no test at all: it reads as coverage and
+	// it is a green tick that means nothing. Only failures are logged above,
+	// so without this line a skip and a pass look identical in a CI log.
+	// and which ones failed, printed at the end rather than where they
+	// happened: a failing build ends with a Gradle stack trace a hundred and
+	// fifty lines long, and on CI the names scroll off the top of whatever
+	// anyone reads. The last line of the log should say what broke.
+	def failed = []
+	afterTest { desc, result ->
+		if (result.resultType == TestResult.ResultType.FAILURE) {
+			failed << "${desc.className.tokenize('.').last()}.${desc.name}"
+		}
+	}
+	afterSuite { desc, result ->
+		if (desc.parent == null) {
+			logger.lifecycle("Tests: ${result.testCount} run, ${result.skippedTestCount} skipped, "
+				+ "${result.failedTestCount} failed (${result.resultType})")
+			failed.each { logger.lifecycle("  failed: " + it) }
+		}
+	}
+}
+
+tasks.withType(JavaCompile).configureEach {
+	options.encoding = 'UTF-8'
+	options.compilerArgs.addAll(['--release', '11', '-Xlint:deprecation', '-Xlint:-options'])
+}
+
+tasks.withType(AbstractArchiveTask) {
+	preserveFileTimestamps = false
+	reproducibleFileOrder = true
+}
+
+jar {
+	manifest {
+		attributes(
+			'Main-Class': 'io.github.instreest.jkite.Main',
+			// the attribute Package.getImplementationVersion() reads back
+			'Implementation-Version': project.version,
+			// and the one that says a manifest is ours, among the many a class
+			// path holds
+			'Jkite-Version': project.version
+		)
+	}
+}
+
+import org.gradle.api.tasks.testing.TestResult
+import com.github.jengelman.gradle.plugins.shadow.transformers.ApacheLicenseResourceTransformer
+import com.github.jengelman.gradle.plugins.shadow.transformers.ApacheNoticeResourceTransformer
+
+shadowJar {
+	mergeServiceFiles()
+	// The bundled libraries each carry their own META-INF/LICENSE and NOTICE,
+	// and one file cannot hold several: without these the last one written wins
+	// and the rest are lost, which is exactly what Apache-2.0 section 4(d) asks
+	// us not to do. They merge the notices into one file instead.
+	transform(ApacheLicenseResourceTransformer)
+	transform(ApacheNoticeResourceTransformer) {
+		// Without these the generated header names the Apache Software
+		// Foundation as this project's copyright holder, which it is not.
+		projectName = 'jkite'
+		organizationName = 'Max Rydahl Andersen and the jkite contributors'
+		organizationURL = 'https://github.com/instreest/jkite'
+		inceptionYear = '2020'
+	}
+	// keep this fork's own notices next to the bundled code, and the licenses
+	// of the bundled libraries, which the transformers above do not carry over
+	from('LICENSE') { into 'META-INF'; rename { 'LICENSE-jkite.txt' } }
+	from('THIRD-PARTY.md') { into 'META-INF'; rename { 'THIRD-PARTY.md' } }
+	from('misc/licenses') { into 'META-INF/licenses' }
+	// a bundled library's module-info describes that library, not this jar
+	exclude 'META-INF/versions/*/module-info.class'
+	exclude 'module-info.class'
+	// likewise META-INF/DEPENDENCIES: it is one dependency's own list, and in
+	// this jar it reads as ours while naming versions that are not here
+	exclude 'META-INF/DEPENDENCIES'
+	manifest {
+		attributes(
+			'Main-Class': 'io.github.instreest.jkite.Main',
+			// what Version.current() asks for first: Package resolves it to the
+			// jar this class came from, not to whichever jar is first on the
+			// class path
+			'Implementation-Version': project.version,
+			// and the one that marks a manifest as ours, for when Package
+			// cannot answer
+			'Jkite-Version': project.version,
+			// plexus-utils ships Java 9/10/11 variants of two classes; without
+			// this they are dead weight and the Java 8 versions are used
+			'Multi-Release': 'true'
+		)
+	}
+	archiveFileName = "jkite.jar"
+}
+
+assemble.dependsOn shadowJar
+
+// The notices THIRD-PARTY.md says are in the jar have to actually be in it.
+// A dependency bump can drop one without failing anything: the build keeps
+// working, the jar keeps running, and the only thing that changes is that a
+// file promising attribution is no longer telling the truth. That is the kind
+// of thing nobody notices until somebody is checking the licences of what they
+// ship, which is exactly when it is expensive.
+tasks.register('verifyNotices') {
+	dependsOn shadowJar
+	description = 'Checks that jkite.jar carries the notices THIRD-PARTY.md claims for it'
+	group = 'verification'
+	def jar = shadowJar.archiveFile
+	def doc = file('THIRD-PARTY.md')
+	inputs.file(jar)
+	inputs.file(doc)
+	outputs.upToDateWhen { false }
+	doLast {
+		def required = [
+			'META-INF/NOTICE',
+			'META-INF/LICENSE-jkite.txt',
+			'META-INF/THIRD-PARTY.md',
+			'META-INF/licenses/Apache-2.0.txt',
+			'META-INF/licenses/MIT-slf4j.txt',
+			'META-INF/licenses/BSD-3-Clause-asm.txt',
+			'META-INF/licenses/EPL-2.0.txt',
+			'META-INF/licenses/MPL-2.0.txt',
+			// carried by plexus-utils at these paths, for the three files in it
+			// that are not Apache-2.0
+			'licenses/extreme.indiana.edu.license.TXT',
+			'licenses/thoughtworks.TXT',
+			'licenses/javolution.license.TXT',
+		]
+		def present = []
+		new java.util.zip.ZipFile(jar.get().asFile).withCloseable { zip ->
+			zip.entries().each { present << it.name }
+		}
+		def missing = required.findAll { !present.contains(it) }
+		if (missing) {
+			throw new GradleException(
+				"THIRD-PARTY.md says jkite.jar carries these and it does not: " + missing.join(', ')
+					+ "\nEither the jar lost them or the document is out of date; fix whichever it is.")
+		}
+		// the acknowledgement the Indiana University licence asks for in
+		// clause 3, which the merged NOTICE is what satisfies
+		def notice = new java.util.zip.ZipFile(jar.get().asFile).withCloseable { zip ->
+			zip.getInputStream(zip.getEntry('META-INF/NOTICE')).getText('UTF-8')
+		}
+		['Indiana University', 'javolution', 'ThoughtWorks'].each { who ->
+			if (!notice.contains(who)) {
+				throw new GradleException(
+					"META-INF/NOTICE no longer acknowledges " + who
+						+ ", which plexus-utils' own NOTICE does and THIRD-PARTY.md says this jar does too.")
+			}
+		}
+	}
+}
+
+check.dependsOn verifyNotices

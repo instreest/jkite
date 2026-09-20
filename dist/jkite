@@ -1,0 +1,418 @@
+#!/usr/bin/env bash
+#
+# jkite launcher for POSIX shells (Linux, macOS, WSL, Git Bash, Cygwin).
+#
+# It runs jkite.jar, so a checkout needs nothing installed, not even a
+# JDK. What it does, in order:
+#
+#   1. Its own options   - --version and --update, answered here without
+#                          running the jar or needing a JDK
+#   2. Which jar to run  - a jkite.jar next to this script when a project
+#                          vendors one, otherwise the one that
+#                          jkite-bootstrap-jar installs from the version
+#                          pinned in jkite.properties
+#   3. Which Java to use - the bootstrap JDK, JAVA_HOME, javac on the PATH, or
+#                          the JDK that jkite-bootstrap-jdk (next to this
+#                          script) downloads when there is none
+#   4. Launch            - exec the jar; it builds the script and runs it
+#
+# That is all it does. Fetching the jar and fetching a JDK belong to the two
+# bootstrap scripts, so each can be run, tested and replaced on its own.
+
+# --- 1. This script's own options --------------------------------------------
+
+# The value of key $1 in jkite.properties, empty when it is not there
+property() {
+  [ -f "$propertiesFile" ] || return 0
+  sed -n "s/^[[:space:]]*$1[[:space:]]*=[[:space:]]*//p" "$propertiesFile" | head -1 | tr -d '\r'
+}
+
+# The version the jar $1 reports for itself, empty when it cannot be asked.
+# The jar is the authority on its own version, and asking it needs no tool for
+# reading a zip; it only needs a JDK that is already here, so nothing is
+# downloaded to answer --version.
+#
+# When it cannot be asked, why is said on stderr: "of an unknown version" on its
+# own leaves a reader with nowhere to go, and it is the only thing a failure
+# here produces. It goes to stderr rather than into a variable because this runs
+# in a command substitution, where a variable would not reach the caller.
+jar_version() {
+  local err out
+  if ! find_existing_java 2>/dev/null; then
+    echo "  (no Java on this machine to ask the jar its version)" 1>&2
+    return 0
+  fi
+  err=$(mktemp "${TMPDIR:-/tmp}/jkite.XXXXXX")
+  out=$("$JAVA_EXEC" -jar "$1" --version 2> "$err" | head -1 | tr -d '\r')
+  if [ -z "$out" ]; then
+    echo "  (could not ask the jar its version)" 1>&2
+    head -1 "$err" | sed 's/^/  /' 1>&2
+  fi
+  rm -f "$err"
+  printf '%s\n' "$out"
+}
+
+# Prints the version that will actually run, and under it where that was
+# decided: the version jkite.properties pins, and the jar that will be
+# used. Nothing is downloaded.
+#
+# The cached jar needs no asking to be named: jkite-bootstrap-jar puts it
+# under the version it pinned and only after its SHA-256 matched, so the
+# directory it sits in is its version. A jar a project vendored next to the
+# launcher is asked, because it is the one that will run and its version is
+# whatever the project put there.
+print_version() {
+  local pinned vendored cached actual
+  pinned=$(property distributionVersion)
+  if [ -z "$pinned" ]; then
+    echo "No distributionVersion in $propertiesFile" 1>&2
+    exit 1
+  fi
+  vendored=$abs_jkite_dir/jkite.jar
+  cached=$CACHEDIR/jkite/$pinned/jkite.jar
+  if [ -f "$vendored" ]; then
+    actual=$(jar_version "$vendored")
+    echo "jkite ${actual:-$pinned}"
+    echo "  pinned $pinned by $propertiesFile"
+    echo "  jar ${actual:-of an unknown version} at $vendored (vendored, so this jar runs and not the pinned version)"
+  elif [ -f "$cached" ]; then
+    echo "jkite $pinned"
+    echo "  pinned $pinned by $propertiesFile"
+    echo "  jar $pinned at $cached"
+  else
+    echo "jkite $pinned"
+    echo "  pinned $pinned by $propertiesFile"
+    echo "  jar not installed yet, it is downloaded on the first run"
+  fi
+}
+
+# --- Asking before going to the network ------------------------------------
+#
+# jkite downloads three kinds of thing: its own jar, a JDK to run that jar
+# with, and the dependencies a script declares. This script can see the first
+# two and asks about them; the jar asks about the third, which only it knows
+# about. Both use the same contract, JKITE_CONFIRM_DOWNLOADS:
+#
+#   auto    the default: ask when there is a terminal, otherwise say what is
+#           being fetched and go ahead, so an unattended build is never left
+#           waiting for an answer nobody is there to give
+#   always  ask, and fetch nothing when there is no terminal to ask on. This is
+#           the setting for a machine that is meant to stay off the network
+#   never   never ask. JKITE_ASSUME_YES=1|true|yes and --yes do the same
+#
+# A run that needs nothing asks nothing, so this is a first-run question.
+
+# Says what jkite was about to download, on stderr.
+say_items() {
+  echo "jkite has to download:" 1>&2
+  printf '%s' "$1" 1>&2
+}
+
+# Whether JKITE_ASSUME_YES says yes. The same three values the jar accepts, and
+# not "any value": JKITE_ASSUME_YES=0 reading as yes is the kind of surprise
+# that is only noticed once something has been downloaded that should not have
+# been.
+assume_yes_from_env() {
+  case $(printf '%s' "${JKITE_ASSUME_YES:-}" | tr 'A-Z' 'a-z') in
+    1|true|yes) return 0 ;;
+  esac
+  return 1
+}
+
+# Asks whether the things listed in $1 may be downloaded. 0 to go ahead, 1 to stop.
+confirm_downloads() {
+  local items=$1 mode answer
+  # --offline is a refusal, not a question, and it is the launcher's to honour:
+  # the jar reads it too, but the jar is one of the things fetched to get there.
+  if [ "${offline:-0}" = 1 ]; then
+    say_items "$items"
+    echo "--offline was given, so nothing was downloaded." 1>&2
+    echo "Run once without it, or vendor jkite.jar next to the launcher." 1>&2
+    return 1
+  fi
+  mode=$(printf '%s' "${JKITE_CONFIRM_DOWNLOADS:-auto}" | tr 'A-Z' 'a-z')
+  if assume_yes_from_env || [ "${assumeYes:-0}" = 1 ] || [ "$mode" = never ]; then
+    return 0
+  fi
+  if [ "$mode" != auto ] && [ "$mode" != always ]; then
+    echo "Ignoring invalid JKITE_CONFIRM_DOWNLOADS: $JKITE_CONFIRM_DOWNLOADS" 1>&2
+    mode=auto
+  fi
+  # Read from the terminal rather than from stdin: stdin belongs to the script
+  # that is about to run, and taking a line from it would lose that line.
+  if ! { exec 3<>/dev/tty; } 2>/dev/null; then
+    no_terminal "$items" "$mode"
+    return $?
+  fi
+  {
+    echo
+    echo "jkite has to download:"
+    printf '%s' "$items"
+    echo
+    printf 'Continue? [Y/n]: '
+  } >&3
+  # A terminal device can open with nobody behind it: Git Bash gives every
+  # process a /dev/tty even when its input is a pipe, and the read then ends
+  # at once. That is the same situation as having no terminal at all.
+  if ! IFS= read -r answer <&3; then
+    exec 3>&-
+    echo 1>&2
+    no_terminal "$items" "$mode"
+    return $?
+  fi
+  echo >&3
+  exec 3>&-
+  case "$answer" in
+    ''|y|Y|yes|YES|Yes) return 0 ;;
+  esac
+  echo "Stopped. Nothing was downloaded." 1>&2
+  return 1
+}
+
+# There is nobody to ask: under always that means fetch nothing, under auto it
+# means say what is happening and carry on.
+no_terminal() {
+  say_items "$1"
+  if [ "$2" = always ]; then
+    echo "There is no terminal to ask on and JKITE_CONFIRM_DOWNLOADS=always." 1>&2
+    echo "Set it to auto or never, or pass --yes, to allow the download." 1>&2
+    return 1
+  fi
+  return 0
+}
+
+# Replaces this installation with the one from $1 (a branch, tag or commit of
+# the jkite repository; the default is whatever install.sh defaults to) by
+# running the install.sh that sits next to this script. Needs no Java and no
+# jar, so it works even when the pinned jar can no longer be downloaded.
+run_update() {
+  local installer=$abs_jkite_dir/install.sh
+  if [ ! -f "$installer" ]; then
+    echo "$installer not found, so this installation cannot update itself." 1>&2
+    exit 1
+  fi
+  confirm_downloads "  - a new jkite installation into $abs_jkite_dir
+" || exit 1
+  if [ -n "$1" ]; then export JKITE_REF=$1; fi
+  bash "$installer" "$abs_jkite_dir" || exit $?
+  if [ -f "$abs_jkite_dir/jkite.jar" ]; then
+    echo 1>&2
+    echo "Warning: $abs_jkite_dir/jkite.jar was not touched, and a jar next to" 1>&2
+    echo "the launcher wins over jkite.properties, so that old jar still runs." 1>&2
+    echo "Remove it, or replace it with the jar of the version just installed." 1>&2
+  fi
+  exit 0
+}
+
+# --- 3. Which Java to use ----------------------------------------------------
+
+# The oldest Java that can run jkite.jar
+minJavaVersion=11
+
+script_dir() {
+  script=${BASH_SOURCE[0]}
+  while [ -L "$script" ]; do
+    dir=$( cd -P "$( dirname "$script" )" >/dev/null 2>&1 && pwd )
+    script=$(readlink "$script")
+    [[ $script != /* ]] && script=$dir/$script
+  done
+  dir=$( cd -P "$( dirname "$script" )" >/dev/null 2>&1 && pwd )
+  echo "$dir"
+}
+
+# The major version of the JDK or JRE in $1, read from its 'release' file
+java_major() {
+  local v
+  [ -f "$1/release" ] || return 1
+  v=$(grep -m1 '^JAVA_VERSION=' "$1/release" | cut -d'"' -f2)
+  [ -n "$v" ] || return 1
+  case "$v" in
+    1.*) v=${v#1.} ;;
+  esac
+  echo "${v%%[.+_-]*}"
+}
+
+# True when $1 holds a JDK (scripts have to be compiled, so a JRE is no use)
+# new enough to run jkite.jar
+usable_java() {
+  local major
+  [ -x "$1/bin/java" ] && [ -x "$1/bin/javac" ] || return 1
+  major=$(java_major "$1") || return 1
+  [ "$major" -ge "$minJavaVersion" ] 2>/dev/null
+}
+
+# Looks for a JDK that is already on this machine and sets JAVA_EXEC to its
+# java, without installing anything; 1 when there is none. Any JDK
+# $minJavaVersion or newer will do; the JDK a script asks for with //JAVA is
+# chosen by jkite.jar itself.
+find_existing_java() {
+  unset JAVA_EXEC
+  # The JDK jkite-bootstrap-jdk downloaded on an earlier run
+  if usable_java "$CACHEDIR/jdks/bootstrap"; then
+    export JAVA_HOME="$CACHEDIR/jdks/bootstrap"
+    JAVA_EXEC="$JAVA_HOME/bin/java"
+    return
+  fi
+  if [[ -n "$JAVA_HOME" ]]; then
+    if usable_java "$JAVA_HOME"; then
+      JAVA_EXEC="$JAVA_HOME/bin/java"
+      return
+    fi
+    echo "JAVA_HOME is set but does not point to a Java $minJavaVersion or newer runtime, ignoring it" 1>&2
+  fi
+  # javac on the PATH (javac rather than java, because a JRE cannot compile
+  # scripts). It is asked where its home is rather than resolved from its own
+  # path, because what is on the PATH is often a shim (jenv, SDKMAN, the
+  # Windows javapath stub) or a symlink chain that readlink -f does not exist
+  # to follow on every platform. -J hands the option to javac's own JVM; it
+  # exists since Java 7, and an older javac just prints an error and no
+  # java.home, which leaves it ignored.
+  local pathJavac pathHome
+  pathJavac=$(command -v javac 2>/dev/null)
+  if [[ -n "$pathJavac" ]]; then
+    pathHome=$("$pathJavac" -J-XshowSettings:properties -version 2>&1 | sed -n 's/^[[:space:]]*java\.home = //p' | head -1)
+    if [[ -n "$pathHome" ]] && usable_java "$pathHome"; then
+      export JAVA_HOME="$pathHome"
+      JAVA_EXEC="$JAVA_HOME/bin/java"
+      return
+    fi
+  fi
+  return 1
+}
+
+# The java to run jkite.jar with, installing one when the machine has none.
+# The bootstrap script prints where it put the JDK; everything else it says
+# goes to stderr. It is run through bash rather than executed, so a checkout
+# that lost the execute bit (core.fileMode=false, a zip download) still works,
+# as it does for this script itself.
+setup_java_exec() {
+  # The search already ran before the download was agreed to; reuse what it found
+  if [ -n "${JAVA_EXEC:-}" ]; then
+    return
+  fi
+  if find_existing_java; then
+    return
+  fi
+  JAVA_HOME=$(bash "$abs_jkite_dir/jkite-bootstrap-jdk") || exit 1
+  export JAVA_HOME
+  JAVA_EXEC="$JAVA_HOME/bin/java"
+}
+
+# --- 4. Launch ---------------------------------------------------------------
+
+# The jar does the rest: it builds the script and runs it as a child process
+# with our stdin, stdout and stderr, and exits with the script's status. So
+# this is a plain exec: nothing is captured, nothing is interpreted.
+execute_jkite() {
+  # shellcheck disable=SC2086 # JKITE_JAVA_OPTIONS is a list of options
+  exec "${JAVA_EXEC}" ${JKITE_JAVA_OPTIONS} -jar "${jarPath}" "$@"
+}
+
+# --yes and --offline are the jar's options, but the launcher fetches the jar
+# and a JDK before the jar ever runs, so it has to read them itself. Only what
+# comes before the script is jkite's: the scan stops at "--" and at the first
+# argument that is not an option, which is the script. A tool of its own with
+# an "-o output" of its own must not put this launcher offline.
+assumeYes=0
+offline=0
+for arg in "$@"; do
+  case "$arg" in
+    --) break ;;
+    -y|--yes) assumeYes=1 ;;
+    -o|--offline) offline=1 ;;
+    -*) ;;
+    *) break ;;
+  esac
+done
+
+abs_jkite_dir=$(script_dir)
+
+# Windows shells (Cygwin, Git Bash, MSYS2) hand over to the Windows launcher.
+# The reason is the JDK: Temurin ships Windows as a .zip, and
+# jkite-bootstrap-jdk unpacks .tar.gz and nothing else - jkite-bootstrap-jdk.cmd
+# is what knows how to unpack the Windows one. Everything the .cmd side needs
+# ships with Windows.
+#
+# Without jkite.cmd beside us there is nothing to hand over to, and the POSIX
+# path is taken. That is not a silent wrong answer: jkite-bootstrap-jdk matches
+# uname -s against Linux and Darwin only and refuses a MINGW/MSYS/CYGWIN one by
+# name, before any download. Checked.
+#
+# A caution about the arguments. MSYS and Cygwin rewrite arguments that look
+# like absolute POSIX paths into Windows ones on the way to a native program.
+# For the script that is wanted - "jkite /c/work/Tool.java" arrives as a path
+# cmd.exe can open - but it happens to every other argument too, so a tool's
+# own "--path=/api/v1" arrives rewritten, silently. Set MSYS_NO_PATHCONV=1
+# (Git Bash) or MSYS2_ARG_CONV_EXCL='*' (MSYS2) for a run that must not have
+# that done to it; the script path is converted here explicitly and so keeps
+# working either way.
+case "$(uname -s)" in
+  CYGWIN*|MINGW*|MSYS*)
+    if [ -f "$abs_jkite_dir/jkite.cmd" ]; then
+      # cygpath ships with all three of these shells. If it is somehow not
+      # there, stop rather than running "cmd /c ''" with the arguments after
+      # it, which would have cmd.exe run the first of them as a command.
+      win_cmd=$(cygpath -m "$abs_jkite_dir/jkite.cmd") || exit 1
+      if [ -z "$win_cmd" ]; then
+        echo "cygpath could not convert $abs_jkite_dir/jkite.cmd" 1>&2
+        exit 1
+      fi
+      cmd /c "$win_cmd" "$@"
+      exit $?
+    fi
+    ;;
+esac
+
+if [[ -z "$JKITE_DIR" ]]; then LITEDIR="$HOME/.jkite"; else LITEDIR="$JKITE_DIR"; fi
+if [[ -z "$JKITE_CACHE_DIR" ]]; then CACHEDIR="$LITEDIR/cache"; else CACHEDIR="$JKITE_CACHE_DIR"; fi
+propertiesFile=$abs_jkite_dir/jkite.properties
+
+# The two options this script answers itself. Both are about the installation
+# rather than about a script, so neither runs the jar and neither needs a JDK.
+case "${1:-}" in
+  -V|--version)
+    print_version
+    exit 0
+    ;;
+  --update)
+    run_update "${2:-}"
+    ;;
+esac
+
+# --- 2. Which jar to run -----------------------------------------------------
+
+# A project may vendor the jar by dropping it next to this script, and then
+# nothing is downloaded. Otherwise the bootstrap script installs the version
+# jkite.properties pins into the cache, shared by every project on this
+# machine, and prints where it put it; everything else it says goes to stderr.
+# It is run through bash rather than executed, so a checkout that lost the
+# execute bit (core.fileMode=false, a zip download) still works, as it does
+# for this script itself.
+jarPath=$abs_jkite_dir/jkite.jar
+
+# What the two bootstrap scripts would have to fetch. Both are asked about at
+# once, so a first run asks a single question rather than one per download.
+netItems=
+if [ ! -f "$jarPath" ]; then
+  netItems="$netItems  - jkite.jar $(property distributionVersion)
+"
+fi
+# This is the real search, not a dry run: it prints why a JAVA_HOME was turned
+# down and leaves JAVA_EXEC set, and setup_java_exec below reuses it. Searching
+# twice would hide those messages, because the first pass leaves JAVA_HOME
+# pointing at whatever it settled on.
+if ! find_existing_java; then
+  netItems="$netItems  - a JDK to run it with (Temurin $(property bootstrapJdkVersion)); this machine has none
+"
+fi
+if [ -n "$netItems" ]; then
+  confirm_downloads "$netItems" || exit 1
+fi
+
+if [ ! -f "$jarPath" ]; then
+  jarPath=$(bash "$abs_jkite_dir/jkite-bootstrap-jar") || exit 1
+fi
+
+setup_java_exec
+
+execute_jkite "$@"

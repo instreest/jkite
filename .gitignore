@@ -1,0 +1,15 @@
+/build
+.gradle
+.idea
+*.iml
+.vscode
+.settings
+.classpath
+.project
+.factorypath
+out
+*.class
+.DS_Store
+
+# the jar is a release asset, never committed (see misc/update-dist.sh)
+dist/jkite.jar

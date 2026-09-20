@@ -1,0 +1,7 @@
+# Files that sit at an upstream path and keep upstream's API, but whose
+# implementation is reduced to what jkite needs. They are NOT overwritten
+# by misc/sync-upstream.sh; when the sync reports that upstream changed one of
+# them, check by hand whether the parts used by the mirrored files changed too.
+src/main/java/dev/jbang/util/Util.java
+src/main/java/dev/jbang/util/JavaUtil.java
+src/main/java/dev/jbang/dependencies/DependencyUtil.java
