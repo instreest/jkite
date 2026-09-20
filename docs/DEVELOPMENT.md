@@ -31,15 +31,37 @@ Both are regenerated together after a version change:
 `--refresh-dependencies` matters: without it, artifacts that are already in the
 Gradle cache are not resolved again and so are left out of the checksums.
 
-Releasing is by hand, through `misc/update-dist.sh`; what the tests cover is
-under [Tests and CI](#tests-and-ci).
+Releasing is `misc/update-dist.sh` and then a workflow run; what the tests
+cover is under [Tests and CI](#tests-and-ci).
 
 ## Releasing
 
+Two steps, and only the first is a commit.
+
 ```bash
 misc/update-dist.sh 0.3.0
-gh release create v0.3.0 dist/* build/libs/jkite.jar
-git add dist && git commit -m "Release 0.3.0"
+git add dist && git commit -m "Release 0.3.0"      # then merge it
+```
+
+Then **Actions -> Release -> Run workflow**, with the same version. It builds
+and tests at that version, publishes the tag, and uploads `dist/*` and the jar.
+
+The workflow exists because of what it refuses. `dist/jkite.properties` pins the
+SHA-256 of the jar a checkout will download, and that value comes from a build,
+so the jar attached to the release has to be the jar the checksum was taken
+from. Nothing on a laptop checks that, and the one time it was not true - a
+rename that edited the URL and left the checksum behind - the pin was the
+checksum of an artifact nothing served. So before it publishes anything it
+checks that the version matches `distributionVersion`, that the tag is free,
+that `dist/` still matches the launcher scripts, that the tests pass, and that
+the jar this commit builds has exactly the digest `dist/` pins. Afterwards it
+fetches what the README tells a reader to fetch and fails if it 404s.
+
+Releasing by hand is the same commands without any of that, which is why the
+button is the documented way:
+
+```bash
+gh release create v0.3.0 --generate-notes dist/* build/libs/jkite.jar
 ```
 
 `misc/update-dist.sh` copies the launcher scripts into `dist/`, builds the jar,

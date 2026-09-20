@@ -1,0 +1,167 @@
+# Publishes a release, by hand, from the Actions tab.
+#
+# There is nothing here a maintainer could not run locally, and that is the
+# point: doing it locally is how the one release bug this project has had got
+# in. dist/jkite.properties pins the SHA-256 of the jar a checkout will
+# download, and it is written from a build - so the jar uploaded to the release
+# has to be the jar that checksum was taken from, or every install at that
+# version fails the verification jkite exists to perform. Nothing on a laptop
+# checks that. This does, and refuses to publish when it does not hold.
+#
+# It is deliberately not automatic. A release is a decision, and a push to main
+# is not one.
+#
+# The inputs reach the shell through the environment and never through
+# ${{ }} inside a run: block. Only somebody who can already push here can
+# dispatch this, so it is not much of a door - but a workflow that interpolates
+# a text box straight into a shell command is the shape of the mistake, and the
+# shape is worth not having in a repository about running other people's code.
+#
+#   Actions -> Release -> Run workflow -> version: 0.2.0
+#
+# The version has to be the one dist/ is already pinned to. Moving to a new
+# version is misc/update-dist.sh <version> in a pull request, which rewrites
+# dist/ and commits it; this workflow only publishes what is already committed.
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to release, without the v (must match distributionVersion in dist/jkite.properties)'
+        required: true
+        type: string
+      draft:
+        description: 'Create it as a draft, to look at before it is live'
+        required: false
+        default: false
+        type: boolean
+
+# The only job here that needs more than reading: creating the release and its
+# tag. Nothing else is granted.
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: publish v${{ inputs.version }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      # Before anything is built, so a typo in the box costs ten seconds rather
+      # than a release that has to be deleted. A release cannot be un-published
+      # from anyone who already fetched it.
+      - name: The version has to be the one dist/ is pinned to
+        shell: bash
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          pinned=$(sed -n 's/^distributionVersion=//p' dist/jkite.properties)
+          if [ "$pinned" != "$VERSION" ]; then
+            echo "dist/ is pinned to $pinned, not $VERSION." 1>&2
+            echo "Run misc/update-dist.sh $VERSION and commit dist/ first." 1>&2
+            exit 1
+          fi
+          echo "dist/ is pinned to $pinned"
+
+      - name: That tag must not already exist
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          if gh release view "v$VERSION" >/dev/null 2>&1; then
+            echo "v$VERSION has already been released." 1>&2
+            exit 1
+          fi
+          if git ls-remote --exit-code --tags origin "refs/tags/v$VERSION" >/dev/null 2>&1; then
+            echo "The tag v$VERSION already exists without a release." 1>&2
+            exit 1
+          fi
+
+      # dist/ is what the release ships and what a project commits, so a dist/
+      # that has drifted from the launcher scripts would publish one and run
+      # the other.
+      - name: dist/ still matches the sources
+        shell: bash
+        run: misc/update-dist.sh --check
+
+      # The tests, not just the jar: a release is the one build that should
+      # never be the first place a failure is noticed. CI has run on this commit
+      # already, and running them again costs a minute and removes the case
+      # where it had not.
+      - name: Build and test at that version
+        shell: bash
+        env:
+          VERSION: ${{ inputs.version }}
+        run: ./gradlew build -PjkiteVersion="$VERSION"
+
+      # The check this workflow exists for. The jar is built with
+      # preserveFileTimestamps = false and reproducibleFileOrder = true, so the
+      # digest is a property of the commit rather than of the machine: if this
+      # does not match, dist/ was not generated from this tree, and publishing
+      # would ship a jar that every launcher refuses.
+      - name: The jar must be the one dist/ pins
+        shell: bash
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          pinned=$(sed -n 's/^distributionSha256Sum=//p' dist/jkite.properties)
+          built=$(sha256sum build/libs/jkite.jar | cut -d' ' -f1)
+          echo "pinned: $pinned"
+          echo "built:  $built"
+          if [ "$pinned" != "$built" ]; then
+            echo 1>&2
+            echo "The jar this commit builds is not the one dist/ pins, so every" 1>&2
+            echo "install at this version would fail its SHA-256 check." 1>&2
+            echo "Run misc/update-dist.sh $VERSION on this commit and" 1>&2
+            echo "commit dist/ before releasing." 1>&2
+            exit 1
+          fi
+
+      # install.sh fetches the scripts from the release too, one at a time, so
+      # every file in dist/ has to be an asset - not only the jar.
+      - name: Publish
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ inputs.version }}
+          TARGET: ${{ github.sha }}
+          DRAFT: ${{ inputs.draft }}
+        run: |
+          draft=
+          [ "$DRAFT" = true ] && draft=--draft
+          gh release create "v$VERSION" \
+            --target "$TARGET" \
+            --title "jkite $VERSION" \
+            --generate-notes \
+            $draft \
+            dist/* build/libs/jkite.jar
+
+      # What a reader will actually type, answered by the release that was just
+      # made rather than by anyone's expectation of it. Skipped for a draft,
+      # which by design is not served under releases/latest.
+      - name: The README's first command now works
+        if: ${{ !inputs.draft }}
+        shell: bash
+        env:
+          VERSION: ${{ inputs.version }}
+          REPO: ${{ github.repository }}
+        run: |
+          base=https://github.com/$REPO/releases/latest/download
+          for f in install.sh jkite.properties jkite jkite.cmd; do
+            code=$(curl -sS -o /dev/null -w '%{http_code}' -L "$base/$f")
+            echo "$f -> HTTP $code"
+            [ "$code" = 200 ] || exit 1
+          done
+          curl -fsSL "$base/jkite.properties" | grep -q "^distributionVersion=$VERSION$"
+          echo "the release serves what jkite.properties pins"
