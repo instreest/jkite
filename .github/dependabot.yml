@@ -1,0 +1,25 @@
+# Keeps the actions the workflows use from going stale silently.
+#
+# They did. The runner started forcing Node 20 actions onto Node 24 and warned
+# about it on every run, and nothing in the repository was watching - the
+# annotation is easy to scroll past, and by the time it stops being a warning
+# it is a workflow that will not start.
+#
+# Only github-actions. Gradle dependencies are pinned in gradle.lockfile and
+# are a different decision with a different blast radius: a dependency of the
+# shipped jar changes what runs on somebody else's machine, and moving one is
+# a change to make deliberately, with the tests as the argument. An action
+# only decides how this repository builds itself.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+    # one pull request that moves them together, rather than four that each
+    # need their own CI run to say the same thing
+    groups:
+      actions:
+        patterns: ['*']
+    commit-message:
+      prefix: 'Update'
