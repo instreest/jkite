@@ -5,6 +5,12 @@
 # annotation is easy to scroll past, and by the time it stops being a warning
 # it is a workflow that will not start.
 #
+# The actions are pinned to commits, which is what makes this config
+# necessary rather than merely tidy: a pinned action never moves on its own, so
+# without something raising the update it stays on the commit it was pinned to
+# forever, security fixes included. Dependabot reads the "# v1.2.3" beside each
+# pin and moves both halves together.
+#
 # Only github-actions. Gradle dependencies are pinned in gradle.lockfile and
 # are a different decision with a different blast radius: a dependency of the
 # shipped jar changes what runs on somebody else's machine, and moving one is
